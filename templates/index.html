@@ -1,1 +1,376 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>VM Dashboard</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.1.0/css/xterm.css" />
+  <script src="https://cdn.jsdelivr.net/npm/xterm@5.1.0/lib/xterm.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.7.0/lib/xterm-addon-fit.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Syne:wght@400;700;800&display=swap" rel="stylesheet"/>
+</head>
 
+<body>
+<div class="wrap">
+
+  <!-- Header -->
+  <header>
+    <h1>VM <span>Control</span></h1>
+    <div class="status-dot">
+      <div class="dot"></div>
+      <span id="vmCount">Loading...</span>
+    </div>
+  </header>
+
+  <!-- Main two-column layout -->
+  <div class="main-grid">
+
+    <!-- LEFT: VM list + Create form -->
+    <div class="left-col">
+
+      <div class="section-title">Active Machines</div>
+      <div id="vmList">
+        <div class="empty"><big>⏳</big>Loading virtual machines…</div>
+      </div>
+
+      <div class="section-title">New Machine</div>
+      <div class="panel">
+        <h2>Provision a Virtual Machine</h2>
+
+        <div class="form-grid">
+          <div class="field">
+            <label>VM Name</label>
+            <input type="text" id="vmName" placeholder="e.g. dev-server-01" autocomplete="off"/>
+          </div>
+          <div class="field">
+            <label>Username</label>
+            <input type="text" id="username" placeholder="e.g. admin" autocomplete="off"/>
+          </div>
+          <div class="field">
+            <label>Password</label>
+            <input type="password" id="password" placeholder="Min. 4 characters"/>
+          </div>
+        </div>
+
+        <div class="form-grid" style="grid-template-columns:1fr; margin-bottom:16px;">
+          <div class="field">
+            <label>Operating System</label>
+            <select id="os">
+              <option value="ubuntu">Ubuntu 22.04 LTS</option>
+              <option value="kali">Kali Linux</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="slider-row">
+          <div class="slider-group">
+            <div class="slider-header">
+              <label>CPU Cores</label>
+              <span class="slider-val" id="cpuVal">2</span>
+            </div>
+            <input type="range" id="cpu" min="1" max="8" value="2"/>
+          </div>
+          <div class="slider-group">
+            <div class="slider-header">
+              <label>RAM (GB)</label>
+              <span class="slider-val" id="ramVal">2 GB</span>
+            </div>
+            <input type="range" id="ram" min="1" max="16" value="2"/>
+          </div>
+          <div class="slider-group">
+            <div class="slider-header">
+              <label>Disk (GB)</label>
+              <span class="slider-val" id="diskVal">20 GB</span>
+            </div>
+            <input type="range" id="disk" min="10" max="100" value="20"/>
+          </div>
+        </div>
+
+        <div class="form-footer">
+          <span id="createStatus"></span>
+          <button class="btn btn-create" id="createBtn" onclick="createVM()">⚡ Create VM</button>
+        </div>
+      </div>
+
+    </div><!-- .left-col -->
+
+    <!-- RIGHT: Inline terminal -->
+    <div class="right-col">
+      <div class="section-title">SSH Console</div>
+      <div id="terminal-panel">
+
+        <!-- idle placeholder -->
+        <div id="terminal-idle">
+          <div class="idle-icon">⌨</div>
+          <div class="idle-text">Select a machine and click SSH to open a terminal</div>
+        </div>
+
+        <!-- terminal (hidden until first SSH call) -->
+        <div id="terminal-wrap" style="display:none; flex-direction:column; height:100%;">
+          <div id="terminal-header">
+            <div class="term-dots">
+              <div class="term-dot r" onclick="closeTerminal()" title="Close"></div>
+              <div class="term-dot y"></div>
+              <div class="term-dot g"></div>
+            </div>
+            <span id="terminal-title">SSH Console</span>
+            <span style="width:52px"></span>
+          </div>
+          <div id="terminal"></div>
+        </div>
+
+      </div>
+    </div><!-- .right-col -->
+
+  </div><!-- .main-grid -->
+
+</div><!-- .wrap -->
+
+<div id="toast"></div>
+
+<script>
+/* ─── XSS helper ─────────────────────────────────────────────── */
+function esc(s) {
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+/* ─── Toast ──────────────────────────────────────────────────── */
+let toastTimer;
+function toast(msg, type = "info") {
+  const el = document.getElementById("toast");
+  el.textContent = msg;
+  el.className = `show ${type}`;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { el.className = ""; }, 3500);
+}
+
+/* ─── Sliders ────────────────────────────────────────────────── */
+document.getElementById("cpu").addEventListener("input", e =>
+  document.getElementById("cpuVal").textContent = e.target.value);
+document.getElementById("ram").addEventListener("input", e =>
+  document.getElementById("ramVal").textContent = e.target.value + " GB");
+document.getElementById("disk").addEventListener("input", e =>
+  document.getElementById("diskVal").textContent = e.target.value + " GB");
+
+/* ─── Load VMs ───────────────────────────────────────────────── */
+let creating = false;
+
+async function loadVMs() {
+  if (creating) return;
+
+  let vms, ips;
+  try {
+    const res = await fetch("/vms");
+    vms = await res.json();
+  } catch { return; }
+
+  document.getElementById("vmCount").textContent =
+    `${vms.length} machine${vms.length !== 1 ? "s" : ""}`;
+
+  if (!vms.length) {
+    document.getElementById("vmList").innerHTML =
+      `<div class="empty"><big>🖥️</big>No virtual machines yet.<br>Create one below.</div>`;
+    return;
+  }
+
+  try {
+    ips = await Promise.all(
+      vms.map(vm =>
+        fetch("/vm_ip/" + encodeURIComponent(vm))
+          .then(r => r.json())
+          .then(d => d.ip || "Waiting…")
+          .catch(() => "Unknown")
+      )
+    );
+  } catch {
+    ips = vms.map(() => "Unknown");
+  }
+
+  const html = vms.map((vm, i) => {
+    const ip = ips[i];
+    const hasIp = ip && !ip.includes("Wait") && !ip.includes("Install") && !ip.includes("Unknown");
+    return `
+    <div class="vm-card" style="animation-delay:${i * 40}ms">
+      <div class="vm-icon">🖥️</div>
+      <div class="vm-info">
+        <div class="vm-name">${esc(vm)}</div>
+        <div class="vm-ip">${esc(ip)}</div>
+      </div>
+      <div class="vm-actions">
+        <button class="btn btn-start"  onclick="startVM('${esc(vm)}')">▶ Start</button>
+        <button class="btn btn-stop"   onclick="stopVM('${esc(vm)}')">■ Stop</button>
+        <button class="btn btn-ssh"
+          onclick='startSSH(${JSON.stringify(vm)}, ${JSON.stringify(ip)})'
+          ${hasIp ? "" : "disabled"}>⌨ SSH</button>
+        <button class="btn btn-delete" onclick="deleteVM('${esc(vm)}')">✕ Delete</button>
+      </div>
+    </div>`;
+  }).join("");
+
+  document.getElementById("vmList").innerHTML = html;
+}
+
+/* ─── VM Actions ─────────────────────────────────────────────── */
+async function startVM(name) {
+  await fetch("/start/" + encodeURIComponent(name));
+  toast(`Started ${name}`, "ok");
+  loadVMs();
+}
+
+async function stopVM(name) {
+  await fetch("/stop/" + encodeURIComponent(name));
+  toast(`Stopped ${name}`, "info");
+  loadVMs();
+}
+
+async function deleteVM(name) {
+  if (!confirm(`Delete "${name}"? This cannot be undone.`)) return;
+  await fetch("/delete/" + encodeURIComponent(name));
+  toast(`Deleted ${name}`, "ok");
+  loadVMs();
+}
+
+async function createVM() {
+  const name     = document.getElementById("vmName").value.trim();
+  const username = document.getElementById("username").value.trim();
+  const password = document.getElementById("password").value;
+  const cpu      = document.getElementById("cpu").value;
+  const ram      = document.getElementById("ram").value;
+  const disk     = document.getElementById("disk").value;
+
+  if (!name || !username || !password) {
+    toast("Please fill in name, username, and password.", "err");
+    return;
+  }
+
+  const status = document.getElementById("createStatus");
+  const btn    = document.getElementById("createBtn");
+  creating     = true;
+  btn.disabled = true;
+  status.innerHTML = `<span class="spinner"></span> Provisioning — this may take 2–3 min…`;
+
+  try {
+    const res = await fetch("/create_vm", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, username, password, cpu, ram, disk })
+    });
+    const out = await res.json();
+
+    if (out.status === "error") {
+      toast("Error: " + out.message, "err");
+      status.textContent = "Creation failed.";
+    } else if (out.status === "warning") {
+      toast(out.message, "info");
+      status.textContent = "VM created — IP pending.";
+    } else {
+      toast(`✓ ${name} created! IP: ${out.ip || "pending"}`, "ok");
+      status.textContent = "";
+      document.getElementById("vmName").value = "";
+    }
+  } catch (e) {
+    toast("Network error: " + e.message, "err");
+    status.textContent = "Request failed.";
+  } finally {
+    creating     = false;
+    btn.disabled = false;
+    loadVMs();
+  }
+}
+
+/* ─── Terminal / SSH ─────────────────────────────────────────── */
+const socket   = io();
+const fitAddon = new FitAddon.FitAddon();
+const term     = new Terminal({
+  cursorBlink: true,
+  fontFamily:  "'JetBrains Mono', monospace",
+  fontSize:    13,
+  lineHeight:  1.4,
+  theme: {
+    background:  "#0a0e14",
+    foreground:  "#c9d1d9",
+    cursor:      "#00d4ff",
+    cursorAccent:"#0a0e14",
+    black:       "#1c2333",
+    brightBlack: "#2d3f55",
+    blue:        "#58a6ff",
+    cyan:        "#00d4ff",
+    green:       "#3fb950",
+    red:         "#f85149",
+    yellow:      "#d29922",
+    white:       "#c9d1d9",
+    brightWhite: "#ffffff",
+  }
+});
+
+term.loadAddon(fitAddon);
+
+// FIX: track whether term.open() has been called yet.
+// Calling term.open() on a hidden element crashes xterm silently
+// and takes down the entire script — including createVM().
+let termMounted = false;
+
+term.onData(data => socket.emit("ssh_input", { data }));
+
+socket.on("ssh_output", msg => term.write(msg.data));
+
+socket.on("ssh_status", msg => {
+  if (msg.status === "connected") {
+    term.writeln("\r\n\x1b[32m● Connected\x1b[0m\r\n");
+  } else if (msg.status === "error") {
+    term.writeln(`\r\n\x1b[31m✗ ${msg.message}\x1b[0m\r\n`);
+  }
+});
+
+function startSSH(vmName, ip) {
+  if (!ip || ip.includes("Waiting") || ip.includes("Unknown") || ip.includes("Install")) {
+    toast("IP not available yet.", "err");
+    return;
+  }
+
+  // Show terminal panel, hide idle placeholder
+  document.getElementById("terminal-idle").style.display = "none";
+  const wrap = document.getElementById("terminal-wrap");
+  wrap.style.display = "flex";
+
+  document.getElementById("terminal-title").textContent = `${vmName}@${ip}`;
+
+  // FIX: only call term.open() once the element is visible
+  if (!termMounted) {
+    term.open(document.getElementById("terminal"));
+    termMounted = true;
+  }
+
+  term.clear();
+  term.writeln(`Connecting to \x1b[36m${ip}\x1b[0m...`);
+
+  // Double rAF ensures layout is complete before fit()
+  requestAnimationFrame(() => requestAnimationFrame(() => fitAddon.fit()));
+
+  socket.emit("start_ssh", { vm_name: vmName });
+}
+
+function closeTerminal() {
+  document.getElementById("terminal-wrap").style.display = "none";
+  document.getElementById("terminal-idle").style.display = "flex";
+  term.clear();
+}
+
+window.addEventListener("resize", () => {
+  if (document.getElementById("terminal-wrap").style.display !== "none") {
+    fitAddon.fit();
+  }
+});
+
+/* ─── Polling ────────────────────────────────────────────────── */
+loadVMs();
+setInterval(loadVMs, 10000);
+</script>
+</body>
+</html>
